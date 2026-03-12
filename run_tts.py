@@ -4,17 +4,18 @@ import os
 import time
 import io
 import shutil
+import subprocess
 from nltk.tokenize import sent_tokenize
 from pydub import AudioSegment
 from tqdm import asyncio as tqdm_asyncio
 
 # ================= 核心配置区 =================
 TEXT_FILE = "oneplus_keynote.txt"
-FINAL_OUTPUT = "OnePlus_Full_Keynote.wav"
+FINAL_WAV = "OnePlus_Full_Keynote.wav"
+FINAL_MP3 = "OnePlus_Full_Keynote.mp3"  # 最终输出 MP3
 TEMP_PARTS_DIR = "/dev/shm/oneplus_parts"
-# 确保启动脚本拉起了 8000-8023 端口
 PORTS = [8000 + i for i in range(24)]    
-FLUSH_SIZE = 50 # 频繁落盘，降低内存压力
+FLUSH_SIZE = 50 
 # ==============================================
 
 results = {}
@@ -33,10 +34,6 @@ def safe_chunking(text, max_words=30):
     return chunks
 
 async def tts_worker(worker_id, queue, session, pbar):
-    """
-    极致抢占模式：每个 Worker 对应一个固定端口
-    从队列抢到任务后直接轰炸该端口
-    """
     port = PORTS[worker_id]
     url = f"http://127.0.0.1:{port}/api/tts"
     
@@ -50,23 +47,16 @@ async def tts_worker(worker_id, queue, session, pbar):
         success = False
         
         try:
-            # 极致性能：减少重试次数，把时间留给下一个任务
             async with session.post(url, json={"text": chunk}, timeout=180) as resp:
                 if resp.status == 200:
                     results[i] = await resp.read()
                     success = True
-                else:
-                    # 快速重试一次
-                    async with session.post(url, json={"text": chunk}, timeout=180) as resp2:
-                        if resp2.status == 200:
-                            results[i] = await resp2.read()
-                            success = True
         except:
             pass
         
         if not success:
-            # 暴力兜底：插入1分钟静音，绝不回头
-            print(f"\n[🚀 跳过] 第 {i} 段失败，注入静音占位")
+            # 插入 1 分钟静音占位
+            print(f"\n[🚀 跳过] 第 {i} 段失败，注入 60s 静音")
             silent_segment = AudioSegment.silent(duration=60000, frame_rate=24000)
             buf = io.BytesIO()
             silent_segment.export(buf, format="wav")
@@ -82,8 +72,6 @@ async def monitor_and_flush(total_chunks, pbar_desc):
     
     while write_ptr < total_chunks:
         target_end = min(write_ptr + FLUSH_SIZE, total_chunks)
-        
-        # 检查批次是否完整
         if all(idx in results for idx in range(write_ptr, target_end)):
             batch_audio = AudioSegment.empty()
             for idx in range(write_ptr, target_end):
@@ -97,15 +85,13 @@ async def monitor_and_flush(total_chunks, pbar_desc):
             write_ptr = target_end
             part_idx += 1
         else:
-            # 推理全部完成后的强制清空逻辑
             if pbar_desc.n == total_chunks:
                 await asyncio.sleep(2)
                 for m_idx in range(write_ptr, target_end):
                     if m_idx not in results:
                         results[m_idx] = results.get(m_idx-1, b"") 
                 continue
-            await asyncio.sleep(1) # 高频检查
-
+            await asyncio.sleep(1)
     return part_files
 
 async def main():
@@ -117,20 +103,18 @@ async def main():
         chunks = safe_chunking(f.read())
     
     total_chunks = len(chunks)
-    print(f"🔥 24 路并发全开！目标：10 分钟内干掉 8662 词。")
+    print(f"🔥 24路并发 + FFmpeg 后期流水线启动！")
 
     queue = asyncio.Queue()
     for i, chunk in enumerate(chunks):
         queue.put_nowait((i, chunk, None))
 
     start_time = time.time()
-    pbar = tqdm_asyncio.tqdm(total=total_chunks, desc="⚡ 生产效率", unit="chunk")
+    pbar = tqdm_asyncio.tqdm(total=total_chunks, desc="⚡ 生成进度", unit="chunk")
     
-    # 彻底解除连接限制
-    connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
+    connector = aiohttp.TCPConnector(limit=0)
     async with aiohttp.ClientSession(connector=connector) as session:
-        # 24个协程对应24个端口
-        workers = [asyncio.create_task(tts_worker(w, queue, session, pbar)) for w in range(24)]
+        workers = [asyncio.create_task(tts_worker(w, queue, session, pbar)) for w in range(len(PORTS))]
         flush_task = asyncio.create_task(monitor_and_flush(total_chunks, pbar))
         
         await queue.join()
@@ -140,15 +124,31 @@ async def main():
     
     pbar.close()
 
-    print(f"\n📦 正在进行最终暴力拼接...")
-    final_audio = AudioSegment.empty()
-    for pf in sorted(part_files):
-        final_audio += AudioSegment.from_file(pf)
+    # --- FFmpeg 高速拼接环节 ---
+    print(f"\n📦 正在使用 FFmpeg 拼接 WAV...")
+    list_file = os.path.join(TEMP_PARTS_DIR, "filelist.txt")
+    with open(list_file, "w") as f:
+        for pf in sorted(part_files):
+            f.write(f"file '{os.path.abspath(pf)}'\n")
     
-    final_audio.export(FINAL_OUTPUT, format="wav")
-    shutil.rmtree(TEMP_PARTS_DIR)
+    # 拼接 WAV (不重新编码，瞬间完成)
+    concat_cmd = f"ffmpeg -f concat -safe 0 -i {list_file} -c copy {FINAL_WAV} -y"
+    subprocess.run(concat_cmd, shell=True, check=True)
+
+    # --- FFmpeg 转码 MP3 环节 ---
+    print(f"🎵 正在转码为 MP3 (192kbps)...")
+    mp3_cmd = f"ffmpeg -i {FINAL_WAV} -codec:a libmp3lame -qscale:a 2 {FINAL_MP3} -y"
+    subprocess.run(mp3_cmd, shell=True, check=True)
+
+    # --- 确认文件存在后清理 ---
+    if os.path.exists(FINAL_MP3):
+        print(f"\n✨ 检测到 MP3 已生成，清理内存碎片...")
+        shutil.rmtree(TEMP_PARTS_DIR)
     
-    print(f"🏁 任务大圆满！耗时: {time.time() - start_time:.2f} 秒")
+    elapsed = time.time() - start_time
+    print(f"\n🎉 任务大圆满！")
+    print(f"⚡ 总耗时: {elapsed:.2f} 秒")
+    print(f"📁 最终成品: {os.path.abspath(FINAL_MP3)}")
 
 if __name__ == "__main__":
     asyncio.run(main())
