@@ -21,3 +21,4 @@ nohup.out
 .DS_Store
 EOF
 core.*
+.gitignore
