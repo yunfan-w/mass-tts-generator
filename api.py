@@ -13,7 +13,7 @@ app = FastAPI(title="Qwen3-TTS-Base Clone API (Static Prompt)")
 
 # ================= 核心配置区 =================
 # 提前把女生音频放在和 api.py 同一个目录下
-REF_AUDIO_PATH = "lxy_english_8db.wav"  # 替换成你的真实文件名
+# REF_AUDIO_PATH = "lxy_english_8db.wav"  # 替换成你的真实文件名
 REF_TEXT = "The lessons you've learn in the growth and experience is never spontaneous. It's always meant to be. There's a higher purpose, a goal, a final destination, or a peak in your journey that you have no idea of until you reach it. " # 替换成她说的真实英文
 # ==============================================
 
@@ -29,19 +29,18 @@ global_voice_prompt = None  # 用于在显存中常驻女生的声纹特征
 @app.on_event("startup")
 async def load_model():
     global model, global_voice_prompt
-    print(f"[{os.getpid()}] 1. 正在加载 Qwen3-TTS-Base 模型...")
+    print(f"[{os.getpid()}] 1. 正在加载 Qwen3-TTS-Base 模型 (适配 2080Ti 架构)...")
     
     model = Qwen3TTSModel.from_pretrained(
-        "./Qwen3-TTS-12Hz-1.7B-Base",
+        "/u/abe6fq/tts400/Qwen3-TTS-12Hz-1.7B-Base", 
         device_map="cuda", 
-        dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2"
+        dtype=torch.float16,             # ⚡ 关键修改：2080Ti 只能用 float16
+        attn_implementation="sdpa"       # ⚡ 关键修改：使用免安装的 sdpa 替代 flash_attention
     )
     
     print(f"[{os.getpid()}] 2. 正在提取并固化女生声纹特征...")
-    # 核心优化：只在启动时提取一次，永远驻留显存！
     global_voice_prompt = model.create_voice_clone_prompt(
-        ref_audio=REF_AUDIO_PATH,
+        ref_audio="/u/abe6fq/tts400/lxy_english_8db.wav", # ⚠️ 强烈建议写绝对路径
         ref_text=REF_TEXT
     )
     print(f"[{os.getpid()}] ✅ 模型和专属声纹均已加载完毕，随时接客！")
@@ -56,7 +55,7 @@ async def generate_speech(req: TTSRequest):
         wavs, sr = model.generate_voice_clone(
             text=req.text,
             language=req.language,
-            voice_clone_prompt=global_voice_prompt
+            voice_clone_prompt=global_voice_prompt,
         )
         
         buffer = io.BytesIO()
@@ -73,6 +72,6 @@ async def generate_speech(req: TTSRequest):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int)
     args = parser.parse_args()
     uvicorn.run(app, host="0.0.0.0", port=args.port, access_log=False)
